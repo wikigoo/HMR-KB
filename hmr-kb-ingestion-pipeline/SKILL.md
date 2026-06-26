@@ -68,8 +68,41 @@ hand-edit it.
 ├── Ready_For_Flowise/        ← approved files moved here by the human admin
 └── agent_state.json          ← session progress (script-managed)
 agent_config.json             ← staging paths
-targets.txt                   ← source URLs, one per line (# comments allowed)
+targets.txt                   ← curated source URLs, one per line (# comments allowed)
+targets_discovered.txt        ← crawl.py output (optional); ingest.py reads it too
+crawl_state.json              ← crawl progress (script-managed; only if crawl.py is used)
 ```
+
+---
+
+## Crawl Step (Optional)
+
+If `targets.txt` holds **listing/index pages** (a brand's support-portal landing page) rather than
+individual document links, run the crawler first to turn each seed into concrete document URLs.
+`scripts/crawl.py` only *discovers* URLs — it never downloads content or writes metadata — and it
+writes its results to `targets_discovered.txt` (next to `targets.txt`), leaving your curated file
+untouched. `ingest.py` automatically reads **both** files, so discoveries flow straight into the
+loop below.
+
+```bash
+# Discover document links from one listing page (prints JSON; writes nothing):
+python scripts/crawl.py discover --config agent_config.json --url "<listing_page_url>"
+
+# Persist the discovery into targets_discovered.txt for ingestion:
+python scripts/crawl.py append --config agent_config.json --url "<listing_page_url>"
+
+# Or crawl every URL already in targets.txt as a seed, in one pass:
+python scripts/crawl.py batch --config agent_config.json
+
+# Review what has been crawled so far:
+python scripts/crawl.py status --config agent_config.json
+```
+
+The crawler is stdlib-only (no extra dependencies), stays on the seed's own domain, respects
+`robots.txt`, and reuses `ingest.py`'s User-Agent, timeout, polite delay, and brand map. Discovered
+documents are ingested by the normal loop and keep the usual `source_type` of `pdf_manual` or
+`crawled_markdown`. It does a single page per seed (no recursion) and does not render JavaScript —
+pages that build their link list in the browser are a known gap.
 
 ---
 

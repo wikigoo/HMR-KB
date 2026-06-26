@@ -14,6 +14,12 @@ agent_state.json.tmp
 */Ready_For_Flowise/
 *.extracted.txt
 
+# Crawl runtime artifacts (produced by crawl.py per-run, not source)
+crawl_state.json
+crawl_state.json.tmp
+targets_discovered.txt
+.pytest_cache/
+
 # OS / editor
 .DS_Store
 Thumbs.db

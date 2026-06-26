@@ -14,28 +14,61 @@ HMR's **Five Product Pillars**. A human reviews the result before anything is up
 ## Why this exists
 
 Building a retrieval knowledge base from scattered manufacturer manuals and support pages is
-repetitive, error-prone work: downloading files, stripping page chrome, avoiding duplicates,
-naming things consistently, and tagging each document so it can be retrieved later. This skill
-automates the mechanical parts deterministically and reserves the **judgement** parts (summaries,
-topic tagging) for the language model — then hands a clean corpus to a human for final approval.
+repetitive, error-prone work: finding the document links, downloading files, stripping page chrome,
+avoiding duplicates, naming things consistently, and tagging each document so it can be retrieved
+later. This skill automates the mechanical parts deterministically and reserves the **judgement**
+parts (summaries, topic tagging) for the language model — then hands a clean corpus to a human for
+final approval.
 
 ### Design principle: deterministic engine + model judgement
 
-The work is split in two so every run is reproducible:
+The work is split into layers so every run is reproducible. Two small, decoupled engines own all the
+mechanical work; the model owns only judgement; a human owns approval.
 
 | Layer | Owner | Responsibilities |
 |-------|-------|------------------|
-| **Mechanical** | `scripts/ingest.py` | fetch, content-type sniff, PDF text extraction, HTML→Markdown, SHA-256 dedup, filename sanitization, `doc_id` generation, real timestamps, crash-safe state |
+| **Discovery** *(optional)* | `scripts/crawl.py` | crawl a listing page, find document URLs, normalize + filter them, write `targets_discovered.txt` |
+| **Ingestion** | `scripts/ingest.py` | fetch, content-type sniff, PDF text extraction, HTML→Markdown, SHA-256 dedup, filename sanitization, `doc_id` generation, real timestamps, crash-safe state |
 | **Judgement** | Claude | clean title, executive summary, pillar mapping, semantic tags, device model |
 | **Approval** | Human | review accuracy, drop bad scrapes, move approved files, upload to Flowise |
 
 The model never re-implements HTTP, hashing, or state handling by hand, so two runs of the same
-`targets.txt` produce the same files and IDs.
+input produce the same files and IDs. `crawl.py` is a thin module that **imports** its User-Agent,
+timeouts, polite delay, and brand map from `ingest.py` — one source of truth, nothing to keep in
+sync by hand.
+
+---
+
+## How a run flows
+
+```
+targets.txt (curated seeds — listing pages and/or direct document links)
+      │
+      │  ── optional discovery step ──
+      ▼
+  crawl.py  discover → append        ──►  targets_discovered.txt
+      │                                          │
+      └──────────────┬───────────────────────────┘
+                     ▼
+            ingest.py reads BOTH files
+                     │
+        next ─► fetch ─► (model fills metadata) ─► commit       (loop, one URL at a time)
+                     │
+                     ▼
+            validate_meta.py  ─►  human review  ─►  Ready_For_Flowise/  ─►  manual upload
+```
+
+If your `targets.txt` already contains direct document links, skip the discovery step entirely — the
+crawler is only there to expand *listing* pages into the individual documents they link to.
 
 ---
 
 ## Features
 
+- **Optional link discovery** — `scripts/crawl.py` turns a *listing* page (a brand's support-portal
+  landing page) into individual document URLs. It stays on the seed's own domain, respects
+  `robots.txt`, normalizes URLs deterministically, and writes to `targets_discovered.txt` so your
+  curated `targets.txt` is never touched. Stdlib-only.
 - **Resumable** — progress is tracked in `agent_state.json`, written after *every* URL, so an
   interrupted run continues cleanly.
 - **Content-hash deduplication** — SHA-256 is computed on the fetched **bytes before anything is
@@ -49,7 +82,7 @@ The model never re-implements HTTP, hashing, or state handling by hand, so two r
 - **Brand organization with fallback** — files are foldered by detected brand; anything unmatched
   lands in `Misc/` instead of stalling.
 - **Polite fetching** — descriptive User-Agent, request timeout, and a courtesy delay between
-  remote requests.
+  remote requests, shared across both engines.
 - **Schema validation** — `scripts/validate_meta.py` gates the corpus before the human handoff.
 - **Human-in-the-loop** — the pipeline never touches Flowise; a person approves every file.
 
@@ -79,13 +112,14 @@ Copy the `hmr-kb-ingestion-pipeline/` folder into your Claude skills directory, 
 `.skill` archive and install it. A pre-built archive is included at the repository root:
 `hmr-kb-ingestion-pipeline.skill`.
 
-Once installed, Claude consults the skill automatically when you ask it to ingest manuals, process
-a `targets.txt`, or build the HMR knowledge base.
+Once installed, Claude consults the skill automatically when you ask it to ingest manuals, crawl a
+support page, process a `targets.txt`, or build the HMR knowledge base.
 
 ### Dependencies
 
-The scripts run on the **Python 3.8+ standard library** alone. Two optional packages dramatically
-improve extraction quality and are used automatically when present:
+The scripts run on the **Python 3.8+ standard library** alone — including the crawler, which uses
+only `html.parser` and `urllib`. Two optional packages dramatically improve *extraction* quality
+(not discovery) and are used automatically when present:
 
 ```bash
 pip install pypdf trafilatura
@@ -95,7 +129,8 @@ pip install pypdf trafilatura
 - `trafilatura` — extracts clean article content from HTML (strips nav, ads, cookie banners).
 
 Without them the pipeline still runs: PDFs are flagged `EXTRACTION_FAILED` for the reviewer, and
-HTML falls back to a crude tag-strip.
+HTML falls back to a crude tag-strip. Running the test suite additionally needs `pytest`
+(dev-only).
 
 ---
 
@@ -117,12 +152,39 @@ On first use the skill asks for a staging directory and the path to your `target
 Populate `targets.txt` with one URL per line (see [`examples/targets.txt`](examples/targets.txt)).
 Lines beginning with `#` are ignored.
 
-### 2. Run the pipeline
+### 2. (Optional) Discover document URLs from listing pages
+
+If a target is a *listing* page rather than a single document, discover its document links first.
+`crawl.py` discovers URLs only — it never downloads content or writes metadata — and it writes its
+results to `targets_discovered.txt` next to `targets.txt`. `ingest.py` reads **both** files, so
+discoveries flow straight into the loop in step 3.
+
+```bash
+# Discover document links from one listing page (prints JSON; writes nothing)
+python hmr-kb-ingestion-pipeline/scripts/crawl.py discover --config agent_config.json --url "https://brand.example/support/"
+
+# Persist the discovery into targets_discovered.txt
+python hmr-kb-ingestion-pipeline/scripts/crawl.py append   --config agent_config.json --url "https://brand.example/support/"
+
+# Or treat every URL already in targets.txt as a seed and discover from each, in one pass
+python hmr-kb-ingestion-pipeline/scripts/crawl.py batch    --config agent_config.json
+
+# Review what has been crawled so far
+python hmr-kb-ingestion-pipeline/scripts/crawl.py status   --config agent_config.json
+```
+
+`append` and `batch` take `--output-mode {append,replace,dry-run}` (default `replace`, which
+rewrites `targets_discovered.txt`; `dry-run` prints what would be added without writing). The
+crawler stays on the seed's domain, respects `robots.txt`, and visits a single page per seed (no
+recursion, no JavaScript rendering — pages that build their link list in the browser are a known
+gap).
+
+### 3. Run the ingestion loop
 
 Claude drives the loop below, one URL at a time. You can also run the engine directly:
 
 ```bash
-# Show the next URL to process (derived live from targets.txt minus done/abandoned)
+# Show the next URL to process (derived live from targets.txt + targets_discovered.txt, minus done/abandoned)
 python hmr-kb-ingestion-pipeline/scripts/ingest.py next    --config agent_config.json
 
 # Fetch + extract + dedup + save one URL (writes a .meta.json stub)
@@ -139,7 +201,7 @@ python hmr-kb-ingestion-pipeline/scripts/ingest.py summary  --config agent_confi
 Between `fetch` and `commit`, Claude reads the generated `*.extracted.txt` and fills the metadata
 stub (title, summary, pillars, tags, device model).
 
-### 3. Validate before handoff
+### 4. Validate before handoff
 
 ```bash
 python hmr-kb-ingestion-pipeline/scripts/validate_meta.py --corpus "C:/HMR_Staging/Corpus"
@@ -148,6 +210,19 @@ python hmr-kb-ingestion-pipeline/scripts/validate_meta.py --corpus "C:/HMR_Stagi
 The validator checks JSON validity, that every model-filled field is complete, that pillar keys are
 valid, that the tag count is 6–12, and that the described content file exists. It exits non-zero if
 anything fails, so it can gate a CI step.
+
+---
+
+## The two targets files
+
+| File | Maintained by | Purpose |
+|------|---------------|---------|
+| `targets.txt` | **You** (curated) | the source list — seeds and/or direct document links. The crawler never edits it. |
+| `targets_discovered.txt` | `crawl.py` (generated) | URLs the crawler found from your seeds, with `# Crawled from <seed>` headers. Safe to delete or regenerate. |
+
+`ingest.py` reads both and de-duplicates across them, so a URL present in both is processed once.
+Keeping them separate means your hand-curated list stays clean while machine discoveries remain
+fully reproducible and disposable.
 
 ---
 
@@ -160,8 +235,10 @@ anything fails, so it can gate a CI step.
 │       ├── samsung_s24_manual_pdf_001.pdf            # original content
 │       ├── samsung_s24_manual_pdf_001.extracted.txt  # text for the model to read
 │       └── samsung_s24_manual_pdf_001.meta.json      # structured metadata
-├── Ready_For_Flowise/    # files a human has approved
-└── agent_state.json      # run progress (script-managed)
+├── Ready_For_Flowise/        # files a human has approved
+├── agent_state.json          # ingestion progress (script-managed)
+├── crawl_state.json          # discovery progress (only if crawl.py is used)
+└── targets_discovered.txt    # crawled URLs (only if crawl.py is used)
 ```
 
 ### Metadata schema (`.meta.json`)
@@ -204,7 +281,9 @@ The pipeline never uploads anything. After ingestion a person:
 
 ## Configuration
 
-A few constants at the top of `scripts/ingest.py` can be tuned:
+Tunable constants live at the top of each engine.
+
+**`scripts/ingest.py`** (shared — `crawl.py` imports several of these):
 
 | Constant | Default | Purpose |
 |----------|---------|---------|
@@ -214,6 +293,31 @@ A few constants at the top of `scripts/ingest.py` can be tuned:
 | `BRAND_MAP` | — | host substring → brand name; extend as your source list grows |
 | `FALLBACK_BRAND` | `Misc` | folder for unmatched hosts |
 
+**`scripts/crawl.py`** (discovery-only):
+
+| Constant | Default | Purpose |
+|----------|---------|---------|
+| `SAME_DOMAIN_ONLY` | `True` | never follow links off the seed's host |
+| `MAX_DISCOVERED_PER_SEED` | `200` | hard cap on URLs kept from one seed page |
+| `ALLOWED_PATH_PATTERNS` | `/support/`, `/manual/`, … | path segments that mark a documentation page |
+| `BLOCKED_PATH_PATTERNS` | `/cart/`, `/login/`, … | path segments to reject (deny wins over allow) |
+
+---
+
+## Testing
+
+`crawl.py`'s discovery core is pure (no network), so its tests run fully offline against local HTML
+fixtures:
+
+```bash
+pytest hmr-kb-ingestion-pipeline/tests/ -q
+```
+
+For an end-to-end wiring check, serve the fixtures over `python -m http.server` and run
+`discover → append → ingest.py next` (a `file://` seed can't exercise the same-domain link filter,
+so use localhost HTTP). The ingestion engine itself is exercised with `file://` URLs in a throwaway
+staging directory — see [`CLAUDE.md`](CLAUDE.md) for the invariants to check.
+
 ---
 
 ## Limitations
@@ -222,8 +326,11 @@ A few constants at the top of `scripts/ingest.py` can be tuned:
   changes between crawls (timestamps, dynamic blocks) won't be recognized as duplicates.
 - **Extraction quality depends on optional libraries.** Install `pypdf` and `trafilatura` for best
   results; without them some documents are flagged for manual handling.
-- **No robots.txt enforcement.** The pipeline processes the curated URLs you provide. Be sure you
-  have the right to download and store the documents you list.
+- **The crawler is intentionally shallow.** Single page per seed, same-domain only, no JavaScript
+  rendering. It is a curated-seed expander, *not* a broad web crawler.
+- **robots.txt: discovery respects it, ingestion does not.** `crawl.py` checks `robots.txt` before
+  fetching a seed (failing open only when it's unreachable); `ingest.py` fetches exactly the URLs you
+  curate. Be sure you have the right to download and store the documents you list.
 
 ---
 
@@ -241,9 +348,13 @@ HMR-Knowledge-Base-Ingestion-Pipeline/
     ├── SKILL.md
     ├── scripts/
     │   ├── ingest.py               # fetch → extract → dedup → save → state engine
+    │   ├── crawl.py                # optional: discover document URLs from listing pages
     │   └── validate_meta.py        # metadata schema validator
-    └── references/
-        └── pillars.md              # Five Pillars mapping + tagging guide
+    ├── references/
+    │   └── pillars.md              # Five Pillars mapping + tagging guide
+    └── tests/                      # offline pytest suite for crawl.py
+        ├── test_crawl.py
+        └── fixtures/               # static HTML listing pages
 ```
 
 ---
