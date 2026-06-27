@@ -201,22 +201,16 @@ def save_state(cfg: dict, st: dict) -> None:
 
 
 def read_targets(cfg: dict) -> list:
-    # The curated targets.txt plus, if present, the machine-discovered targets_discovered.txt that
-    # crawl.py writes. Reading both keeps the human-curated file pristine while still feeding crawled
-    # URLs into the loop. Blank lines and '#' comments are skipped; cross-file dupes collapse.
-    discovered = cfg.get("discovered_targets_file")
-    sources = [Path(cfg["targets_file"])]
-    sources.append(Path(discovered) if discovered
-                   else Path(cfg["targets_file"]).parent / "targets_discovered.txt")
+    p = Path(cfg["targets_file"])
+    if not p.exists():
+        return []
+    lines = p.read_text(encoding="utf-8").splitlines()
     out, seen = [], set()
-    for p in sources:
-        if not p.exists():
-            continue
-        for ln in p.read_text(encoding="utf-8").splitlines():
-            u = ln.strip()
-            if u and not u.startswith("#") and u not in seen:
-                seen.add(u)
-                out.append(u)
+    for ln in lines:
+        u = ln.strip()
+        if u and not u.startswith("#") and u not in seen:
+            seen.add(u)
+            out.append(u)
     return out
 
 
@@ -239,7 +233,9 @@ def pending_urls(cfg: dict, st: dict) -> list:
 # ---------------------------------------------------------------------------
 
 def http_get(url: str):
-    """Return (bytes, content_type). Uses curl_cffi for Cloudflare-protected sites."""
+    """Return (bytes, content_type). Raises urllib errors to the caller."""
+    # Courtesy pause before hitting a remote host, so a long targets.txt doesn't
+    # hammer a site. Skipped for local/file:// sources where it would only add latency.
     if url.lower().startswith(("http://", "https://")):
         time.sleep(POLITE_DELAY_SECONDS)
     # Try curl_cffi first (impersonates Chrome TLS fingerprint), fall back to urllib
